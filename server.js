@@ -12,6 +12,7 @@ const path = require('path');
 const authRoutes = require('./src/routes/auth');
 const uploadRoutes = require('./src/routes/upload');
 const recordingRoutes = require('./src/routes/recording');
+const videoRoutes = require('./src/routes/video');
 
 // 로거 설정
 const logger = require('./src/utils/logger');
@@ -53,6 +54,9 @@ app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(morgan('combined', { stream: { write: message => logger.info(message.trim()) }}));
 
+// 정적 파일 서빙 (public 폴더)
+app.use('/public', express.static(path.join(__dirname, 'public')));
+
 // 헬스 체크
 app.get('/health', (req, res) => {
     res.json({ 
@@ -66,6 +70,7 @@ app.get('/health', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/recording', recordingRoutes);
+app.use('/api/video', videoRoutes);
 
 // 404 핸들러
 app.use((req, res) => {
