@@ -1,112 +1,101 @@
-// src/middleware/auth.js - 인증 미들웨어
+// auth.js - 인증 미들웨어
 const jwt = require('jsonwebtoken');
-const logger = require('../utils/logger');
+const { createClient } = require('@supabase/supabase-js');
+
+// Supabase 클라이언트
+const supabase = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY
+);
 
 /**
  * JWT 토큰 생성
  */
 function generateToken(payload) {
-    return jwt.sign(payload, process.env.JWT_SECRET, {
-        expiresIn: process.env.JWT_EXPIRES_IN || '24h'
+    return jwt.sign(payload, process.env.JWT_SECRET || 'default-secret-key', {
+        expiresIn: '24h'
     });
 }
 
 /**
- * JWT 토큰 검증
+ * JWT 토큰 검증 미들웨어
  */
-function verifyToken(token) {
-    try {
-        return jwt.verify(token, process.env.JWT_SECRET);
-    } catch (error) {
-        logger.error('Token verification failed:', error.message);
-        return null;
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+
+    if (!token) {
+        return res.status(401).json({ 
+            success: false, 
+            error: 'Access token required' 
+        });
     }
+
+    jwt.verify(token, process.env.JWT_SECRET || 'default-secret-key', (err, user) => {
+        if (err) {
+            return res.status(403).json({ 
+                success: false, 
+                error: 'Invalid or expired token' 
+            });
+        }
+        req.user = user;
+        next();
+    });
 }
 
 /**
- * 작업자 인증 미들웨어
+ * 선택적 인증 (인증 없어도 통과, 있으면 유저 정보 추가)
  */
-function authenticateWorker(req, res, next) {
-    try {
-        // Authorization 헤더에서 토큰 추출
-        const authHeader = req.headers.authorization;
-        
-        if (!authHeader) {
-            return res.status(401).json({ error: 'No authorization header' });
-        }
+function optionalAuth(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
 
-        const token = authHeader.startsWith('Bearer ') 
-            ? authHeader.slice(7) 
-            : authHeader;
-
-        if (!token) {
-            return res.status(401).json({ error: 'No token provided' });
-        }
-
-        // 토큰 검증
-        const decoded = verifyToken(token);
-        
-        if (!decoded) {
-            return res.status(401).json({ error: 'Invalid or expired token' });
-        }
-
-        // 작업자 정보를 request에 추가
-        req.worker = {
-            worker_id: decoded.worker_id,
-            company_id: decoded.company_id,
-            worker_name: decoded.worker_name,
-            company_name: decoded.company_name
-        };
-
-        next();
-    } catch (error) {
-        logger.error('Authentication error:', error);
-        res.status(401).json({ error: 'Authentication failed' });
+    if (!token) {
+        return next();
     }
+
+    jwt.verify(token, process.env.JWT_SECRET || 'default-secret-key', (err, user) => {
+        if (!err) {
+            req.user = user;
+        }
+        next();
+    });
 }
 
 /**
- * 관리자 인증 미들웨어 (선택적)
+ * 회사 권한 검증
  */
-function authenticateAdmin(req, res, next) {
+async function verifyCompanyAccess(req, res, next) {
     try {
-        const authHeader = req.headers.authorization;
+        if (!req.user) {
+            return res.status(401).json({ 
+                success: false, 
+                error: 'Authentication required' 
+            });
+        }
+
+        const { company_id } = req.params;
         
-        if (!authHeader) {
-            return res.status(401).json({ error: 'No authorization header' });
+        if (req.user.company_id !== company_id) {
+            return res.status(403).json({ 
+                success: false, 
+                error: 'Access denied to this company' 
+            });
         }
-
-        const token = authHeader.startsWith('Bearer ') 
-            ? authHeader.slice(7) 
-            : authHeader;
-
-        if (!token) {
-            return res.status(401).json({ error: 'No token provided' });
-        }
-
-        const decoded = verifyToken(token);
-        
-        if (!decoded || decoded.role !== 'admin') {
-            return res.status(403).json({ error: 'Admin access required' });
-        }
-
-        req.admin = {
-            admin_id: decoded.admin_id,
-            company_id: decoded.company_id,
-            email: decoded.email,
-            role: decoded.role
-        };
 
         next();
     } catch (error) {
-        logger.error('Admin authentication error:', error);
-        res.status(401).json({ error: 'Authentication failed' });
+        res.status(500).json({ 
+            success: false, 
+            error: error.message 
+        });
     }
 }
 
 module.exports = {
     generateToken,
-    verifyToken,
-    authenticateWorker,
-    authenticateAdmin
+    authenticateToken,
+    optionalAuth,
+    verifyCompanyAccess,
+    supabase
 };

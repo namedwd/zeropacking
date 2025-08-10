@@ -1,181 +1,324 @@
-// src/routes/recording.js - 녹화 관련 라우트
+// recording.js - 녹화 관련 라우터
 const express = require('express');
 const router = express.Router();
-const { authenticateWorker } = require('../middleware/auth');
-const supabase = require('../config/database');
+const { authenticateToken, supabase } = require('../middleware/auth');
 const logger = require('../utils/logger');
 
 /**
  * 녹화 시작
- * POST /api/recording/start
  */
-router.post('/start', authenticateWorker, async (req, res) => {
+router.post('/start', authenticateToken, async (req, res) => {
     try {
-        const { barcode, resolution, fps } = req.body;
-        const { worker_id } = req.worker;
+        const { barcode, worker_id, company_id } = req.body;
 
+        // 입력 검증
         if (!barcode) {
-            return res.status(400).json({ error: 'Barcode is required' });
+            return res.status(400).json({
+                success: false,
+                error: 'Barcode is required'
+            });
         }
 
-        // RPC 함수 호출
-        const { data, error } = await supabase.rpc('start_recording', {
-            p_worker_id: worker_id,
-            p_barcode: barcode,
-            p_resolution: resolution || '1920x1080',
-            p_fps: fps || 30
-        });
+        // 토큰에서 가져온 정보 사용 (보안)
+        const actualWorkerId = req.user.worker_id;
+        const actualCompanyId = req.user.company_id;
+
+        logger.info(`Recording started - Worker: ${actualWorkerId}, Barcode: ${barcode}`);
+
+        // 녹화 레코드 생성
+        const { data, error } = await supabase
+            .from('recordings')
+            .insert({
+                company_id: actualCompanyId,
+                worker_id: actualWorkerId,
+                barcode: barcode,
+                start_time: new Date().toISOString(),
+                status: 'recording'
+            })
+            .select()
+            .single();
 
         if (error) {
-            if (error.message.includes('already in progress')) {
-                return res.status(409).json({ error: 'Recording already in progress for this barcode' });
-            }
-            throw error;
+            logger.error('Failed to create recording record:', error);
+            return res.status(500).json({
+                success: false,
+                error: 'Failed to start recording'
+            });
         }
 
         res.json({
             success: true,
-            recording_id: data,
-            barcode,
-            status: 'recording'
+            recording_id: data.id,
+            message: 'Recording started successfully'
         });
 
-        logger.info(`Recording started: ${data} for barcode ${barcode}`);
-
     } catch (error) {
-        logger.error('Error starting recording:', error);
-        res.status(500).json({ error: 'Failed to start recording' });
+        logger.error('Start recording error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
     }
 });
 
 /**
  * 녹화 종료
- * POST /api/recording/end
  */
-router.post('/end', authenticateWorker, async (req, res) => {
+router.post('/end', authenticateToken, async (req, res) => {
     try {
-        const { recording_id, file_size_bytes, cloud_url } = req.body;
+        const { recording_id, duration_seconds, file_size_bytes } = req.body;
 
         if (!recording_id) {
-            return res.status(400).json({ error: 'Recording ID is required' });
+            return res.status(400).json({
+                success: false,
+                error: 'Recording ID is required'
+            });
         }
 
-        // RPC 함수 호출
-        const { data, error } = await supabase.rpc('end_recording', {
-            p_recording_id: recording_id,
-            p_file_size_bytes: file_size_bytes || null,
-            p_cloud_url: cloud_url || null
-        });
+        logger.info(`Recording ended - ID: ${recording_id}, Duration: ${duration_seconds}s`);
+
+        // 녹화 레코드 업데이트
+        const { data, error } = await supabase
+            .from('recordings')
+            .update({
+                end_time: new Date().toISOString(),
+                duration_seconds: duration_seconds || 0,
+                file_size_bytes: file_size_bytes || 0,
+                status: 'uploading',
+                updated_at: new Date().toISOString()
+            })
+            .eq('id', recording_id)
+            .eq('worker_id', req.user.worker_id) // 보안: 자신의 녹화만 수정 가능
+            .select()
+            .single();
 
         if (error) {
-            if (error.message.includes('not found')) {
-                return res.status(404).json({ error: 'Recording not found or already ended' });
-            }
-            throw error;
+            logger.error('Failed to update recording record:', error);
+            return res.status(500).json({
+                success: false,
+                error: 'Failed to end recording'
+            });
         }
 
         res.json({
             success: true,
-            recording_id,
-            status: cloud_url ? 'completed' : 'uploading'
+            recording: data,
+            message: 'Recording ended successfully'
         });
 
-        logger.info(`Recording ended: ${recording_id}`);
-
     } catch (error) {
-        logger.error('Error ending recording:', error);
-        res.status(500).json({ error: 'Failed to end recording' });
+        logger.error('End recording error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
     }
 });
 
 /**
- * 녹화 상태 업데이트
- * PATCH /api/recording/:id/status
+ * 업로드 완료 처리
  */
-router.patch('/:id/status', authenticateWorker, async (req, res) => {
+router.post('/upload-complete', authenticateToken, async (req, res) => {
     try {
-        const { id } = req.params;
-        const { status, cloud_url, error_message } = req.body;
-        const { worker_id } = req.worker;
+        const { 
+            recording_id, 
+            cloud_url, 
+            cloud_provider = 'cloudinary',
+            thumbnail_url,
+            metadata 
+        } = req.body;
 
-        // 권한 확인
-        const { data: recording, error: fetchError } = await supabase
-            .from('recordings')
-            .select('worker_id')
-            .eq('id', id)
-            .single();
-
-        if (fetchError || !recording) {
-            return res.status(404).json({ error: 'Recording not found' });
+        if (!recording_id || !cloud_url) {
+            return res.status(400).json({
+                success: false,
+                error: 'Recording ID and cloud URL are required'
+            });
         }
 
-        if (recording.worker_id !== worker_id) {
-            return res.status(403).json({ error: 'Unauthorized to update this recording' });
-        }
+        logger.info(`Upload completed - Recording: ${recording_id}`);
 
-        // 상태 업데이트
+        // 녹화 레코드 업데이트
         const updateData = {
-            status,
+            cloud_url: cloud_url,
+            cloud_provider: cloud_provider,
+            status: 'completed',
             updated_at: new Date().toISOString()
         };
 
-        if (cloud_url) updateData.cloud_url = cloud_url;
-        if (error_message) updateData.error_message = error_message;
+        if (thumbnail_url) {
+            updateData.thumbnail_url = thumbnail_url;
+        }
 
-        const { error: updateError } = await supabase
+        if (metadata) {
+            updateData.metadata = metadata;
+        }
+
+        const { data, error } = await supabase
             .from('recordings')
             .update(updateData)
-            .eq('id', id);
+            .eq('id', recording_id)
+            .eq('worker_id', req.user.worker_id)
+            .select()
+            .single();
 
-        if (updateError) throw updateError;
+        if (error) {
+            logger.error('Failed to update recording with upload info:', error);
+            return res.status(500).json({
+                success: false,
+                error: 'Failed to update recording'
+            });
+        }
 
         res.json({
             success: true,
-            recording_id: id,
-            status
+            recording: data,
+            message: 'Upload completed successfully'
         });
 
     } catch (error) {
-        logger.error('Error updating recording status:', error);
-        res.status(500).json({ error: 'Failed to update recording status' });
+        logger.error('Upload complete error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
     }
 });
 
 /**
  * 녹화 목록 조회
- * GET /api/recording/list
  */
-router.get('/list', authenticateWorker, async (req, res) => {
+router.get('/list', authenticateToken, async (req, res) => {
     try {
-        const { worker_id, company_id } = req.worker;
-        const { limit = 20, offset = 0, barcode, status } = req.query;
+        const { page = 1, limit = 20, barcode, status } = req.query;
+        const offset = (page - 1) * limit;
 
         let query = supabase
             .from('recordings')
-            .select('*')
-            .eq('company_id', company_id)
+            .select('*', { count: 'exact' })
+            .eq('company_id', req.user.company_id)
             .order('created_at', { ascending: false })
             .range(offset, offset + limit - 1);
 
         // 필터 적용
-        if (barcode) query = query.eq('barcode', barcode);
-        if (status) query = query.eq('status', status);
+        if (barcode) {
+            query = query.ilike('barcode', `%${barcode}%`);
+        }
+
+        if (status) {
+            query = query.eq('status', status);
+        }
 
         const { data, error, count } = await query;
 
-        if (error) throw error;
+        if (error) {
+            logger.error('Failed to fetch recordings:', error);
+            return res.status(500).json({
+                success: false,
+                error: 'Failed to fetch recordings'
+            });
+        }
 
         res.json({
             success: true,
             recordings: data,
-            total: count,
-            limit: parseInt(limit),
-            offset: parseInt(offset)
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total: count,
+                totalPages: Math.ceil(count / limit)
+            }
         });
 
     } catch (error) {
-        logger.error('Error fetching recordings:', error);
-        res.status(500).json({ error: 'Failed to fetch recordings' });
+        logger.error('List recordings error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * 녹화 상세 조회
+ */
+router.get('/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        const { data, error } = await supabase
+            .from('recordings')
+            .select(`
+                *,
+                worker:worker_accounts(worker_name, worker_code),
+                company:companies(name)
+            `)
+            .eq('id', id)
+            .eq('company_id', req.user.company_id)
+            .single();
+
+        if (error) {
+            logger.error('Failed to fetch recording:', error);
+            return res.status(404).json({
+                success: false,
+                error: 'Recording not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            recording: data
+        });
+
+    } catch (error) {
+        logger.error('Get recording error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+/**
+ * 녹화 삭제 (soft delete)
+ */
+router.delete('/:id', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Soft delete - status를 'deleted'로 변경
+        const { data, error } = await supabase
+            .from('recordings')
+            .update({
+                status: 'deleted',
+                updated_at: new Date().toISOString()
+            })
+            .eq('id', id)
+            .eq('company_id', req.user.company_id)
+            .select()
+            .single();
+
+        if (error) {
+            logger.error('Failed to delete recording:', error);
+            return res.status(404).json({
+                success: false,
+                error: 'Recording not found or cannot be deleted'
+            });
+        }
+
+        logger.info(`Recording deleted: ${id}`);
+
+        res.json({
+            success: true,
+            message: 'Recording deleted successfully',
+            recording: data
+        });
+
+    } catch (error) {
+        logger.error('Delete recording error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
     }
 });
 

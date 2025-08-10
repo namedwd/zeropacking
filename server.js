@@ -13,6 +13,7 @@ const authRoutes = require('./src/routes/auth');
 const uploadRoutes = require('./src/routes/upload');
 const recordingRoutes = require('./src/routes/recording');
 const videoRoutes = require('./src/routes/video');
+const cloudinaryRoutes = require('./src/routes/cloudinary');
 
 // 로거 설정
 const logger = require('./src/utils/logger');
@@ -71,6 +72,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/recording', recordingRoutes);
 app.use('/api/video', videoRoutes);
+app.use('/api/cloudinary', cloudinaryRoutes);
 
 // 404 핸들러
 app.use((req, res) => {

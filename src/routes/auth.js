@@ -1,14 +1,111 @@
-// src/routes/auth.js - 인증 라우트
+// auth.js - 인증 라우터
 const express = require('express');
 const router = express.Router();
-const bcrypt = require('bcryptjs');
-const { generateToken } = require('../middleware/auth');
-const supabase = require('../config/database');
+const bcrypt = require('bcrypt');
+const { generateToken, supabase } = require('../middleware/auth');
 const logger = require('../utils/logger');
 
 /**
- * 작업자 로그인
- * POST /api/auth/worker/login
+ * 작업자 간단 로그인 (회사 선택 없음)
+ */
+router.post('/worker/login-simple', async (req, res) => {
+    try {
+        const { username, password } = req.body;
+
+        // 입력 검증
+        if (!username || !password) {
+            return res.status(400).json({
+                success: false,
+                error: 'Username and password are required'
+            });
+        }
+
+        logger.info(`Login attempt for worker: ${username}`);
+
+        // 작업자 계정 조회 (회사 정보 포함)
+        const { data: workers, error: fetchError } = await supabase
+            .from('worker_accounts')
+            .select(`
+                id,
+                username,
+                password_hash,
+                worker_name,
+                worker_code,
+                department,
+                company_id,
+                is_active,
+                companies (
+                    id,
+                    name
+                )
+            `)
+            .eq('username', username)
+            .eq('is_active', true)
+            .single();
+
+        if (fetchError || !workers) {
+            logger.error('Worker not found:', username);
+            return res.status(401).json({
+                success: false,
+                error: 'Invalid username or password'
+            });
+        }
+
+        // 비밀번호 검증
+        const validPassword = await bcrypt.compare(password, workers.password_hash);
+        
+        if (!validPassword) {
+            logger.error('Invalid password for worker:', username);
+            return res.status(401).json({
+                success: false,
+                error: 'Invalid username or password'
+            });
+        }
+
+        // JWT 토큰 생성
+        const token = generateToken({
+            worker_id: workers.id,
+            worker_name: workers.worker_name,
+            username: workers.username,
+            company_id: workers.company_id,
+            company_name: workers.companies.name,
+            department: workers.department,
+            type: 'worker'
+        });
+
+        // 마지막 로그인 시간 업데이트
+        await supabase
+            .from('worker_accounts')
+            .update({ last_login_at: new Date().toISOString() })
+            .eq('id', workers.id);
+
+        logger.info(`Worker ${username} logged in successfully from company ${workers.companies.name}`);
+
+        res.json({
+            success: true,
+            token,
+            worker: {
+                id: workers.id,
+                name: workers.worker_name,
+                username: workers.username,
+                company_id: workers.company_id,
+                company_name: workers.companies.name,
+                department: workers.department,
+                worker_code: workers.worker_code
+            }
+        });
+
+    } catch (error) {
+        logger.error('Login error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
+/**
+ * 작업자 로그인 (기존 - 하위 호환성)
  */
 router.post('/worker/login', async (req, res) => {
     try {
@@ -16,12 +113,15 @@ router.post('/worker/login', async (req, res) => {
 
         // 입력 검증
         if (!company_id || !username || !password) {
-            return res.status(400).json({ 
-                error: 'Company ID, username, and password are required' 
+            return res.status(400).json({
+                success: false,
+                error: 'Company ID, username and password are required'
             });
         }
 
-        // Supabase RPC 함수 호출
+        logger.info(`Login attempt for worker: ${username} from company: ${company_id}`);
+
+        // RPC 함수 호출로 인증
         const { data, error } = await supabase.rpc('authenticate_worker', {
             p_company_id: company_id,
             p_username: username,
@@ -29,88 +129,106 @@ router.post('/worker/login', async (req, res) => {
         });
 
         if (error) {
-            logger.error('Worker authentication error:', error);
-            return res.status(401).json({ error: 'Invalid credentials' });
+            logger.error('Authentication RPC error:', error);
+            return res.status(401).json({
+                success: false,
+                error: 'Authentication failed'
+            });
         }
 
         if (!data || data.length === 0) {
-            return res.status(401).json({ error: 'Invalid credentials' });
+            return res.status(401).json({
+                success: false,
+                error: 'Invalid username or password'
+            });
         }
 
-        const workerData = data[0];
+        const worker = data[0];
 
         // JWT 토큰 생성
         const token = generateToken({
-            worker_id: workerData.worker_id,
+            worker_id: worker.worker_id,
+            worker_name: worker.worker_name,
+            username: username,
             company_id: company_id,
-            worker_name: workerData.worker_name,
-            company_name: workerData.company_name,
+            company_name: worker.company_name,
+            department: worker.department,
             type: 'worker'
         });
 
-        // 응답
+        // 마지막 로그인 시간 업데이트
+        await supabase
+            .from('worker_accounts')
+            .update({ last_login_at: new Date().toISOString() })
+            .eq('id', worker.worker_id);
+
+        logger.info(`Worker ${username} logged in successfully`);
+
         res.json({
             success: true,
             token,
             worker: {
-                worker_id: workerData.worker_id,
-                worker_name: workerData.worker_name,
-                company_name: workerData.company_name,
-                company_id: company_id
+                id: worker.worker_id,
+                name: worker.worker_name,
+                username: username,
+                company_id: company_id,
+                company_name: worker.company_name,
+                department: worker.department,
+                worker_code: worker.worker_code
             }
         });
 
-        logger.info(`Worker logged in: ${username} from company ${workerData.company_name}`);
-
     } catch (error) {
         logger.error('Login error:', error);
-        res.status(500).json({ error: 'Login failed' });
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error'
+        });
     }
 });
 
 /**
  * 토큰 검증
- * POST /api/auth/verify
  */
 router.post('/verify', async (req, res) => {
     try {
         const { token } = req.body;
 
         if (!token) {
-            return res.status(400).json({ error: 'Token is required' });
+            return res.status(400).json({
+                success: false,
+                error: 'Token is required'
+            });
         }
 
+        // JWT 검증
         const jwt = require('jsonwebtoken');
-        
-        jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-            if (err) {
-                return res.status(401).json({ 
-                    valid: false, 
-                    error: 'Invalid or expired token' 
-                });
-            }
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default-secret-key');
 
-            res.json({
-                valid: true,
-                decoded: {
-                    worker_id: decoded.worker_id,
-                    company_id: decoded.company_id,
-                    worker_name: decoded.worker_name,
-                    company_name: decoded.company_name,
-                    type: decoded.type
-                }
-            });
+        res.json({
+            success: true,
+            valid: true,
+            user: decoded
         });
 
     } catch (error) {
-        logger.error('Token verification error:', error);
-        res.status(500).json({ error: 'Verification failed' });
+        if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+            return res.json({
+                success: true,
+                valid: false,
+                error: error.message
+            });
+        }
+
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error'
+        });
     }
 });
 
 /**
- * 회사 목록 조회 (로그인 화면용)
- * GET /api/auth/companies
+ * 회사 목록 조회 (공개)
  */
 router.get('/companies', async (req, res) => {
     try {
@@ -128,68 +246,22 @@ router.get('/companies', async (req, res) => {
         });
 
     } catch (error) {
-        logger.error('Error fetching companies:', error);
-        res.status(500).json({ error: 'Failed to fetch companies' });
+        logger.error('Get companies error:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Failed to fetch companies'
+        });
     }
 });
 
 /**
- * 작업자 계정 생성 (관리자용)
- * POST /api/auth/worker/create
+ * 관리자 로그인 (나중에 구현)
  */
-router.post('/worker/create', async (req, res) => {
-    try {
-        const { company_id, username, password, worker_name, worker_code, department } = req.body;
-
-        // 입력 검증
-        if (!company_id || !username || !password || !worker_name) {
-            return res.status(400).json({ 
-                error: 'Required fields: company_id, username, password, worker_name' 
-            });
-        }
-
-        // 비밀번호 해시
-        const salt = await bcrypt.genSalt(10);
-        const password_hash = await bcrypt.hash(password, salt);
-
-        // 작업자 계정 생성
-        const { data, error } = await supabase
-            .from('worker_accounts')
-            .insert({
-                company_id,
-                username,
-                password_hash,
-                worker_name,
-                worker_code,
-                department,
-                is_active: true
-            })
-            .select()
-            .single();
-
-        if (error) {
-            if (error.code === '23505') { // Unique violation
-                return res.status(409).json({ error: 'Username already exists for this company' });
-            }
-            throw error;
-        }
-
-        res.json({
-            success: true,
-            worker: {
-                id: data.id,
-                username: data.username,
-                worker_name: data.worker_name,
-                worker_code: data.worker_code
-            }
-        });
-
-        logger.info(`Worker account created: ${username} for company ${company_id}`);
-
-    } catch (error) {
-        logger.error('Error creating worker account:', error);
-        res.status(500).json({ error: 'Failed to create worker account' });
-    }
+router.post('/admin/login', async (req, res) => {
+    res.status(501).json({
+        success: false,
+        error: 'Admin login not implemented yet'
+    });
 });
 
 module.exports = router;
