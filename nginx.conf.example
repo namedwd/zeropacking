@@ -1,0 +1,35 @@
+server {
+    listen 80;
+    server_name your-domain.com;
+
+    # 클라이언트 최대 업로드 크기 (1GB)
+    client_max_body_size 1024M;
+    
+    # 타임아웃 설정 (긴 업로드 처리)
+    proxy_connect_timeout 600;
+    proxy_send_timeout 600;
+    proxy_read_timeout 600;
+    send_timeout 600;
+
+    location / {
+        proxy_pass http://localhost:3001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # 버퍼 설정 (대용량 파일 처리)
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }
+
+    # 헬스체크 엔드포인트
+    location /health {
+        access_log off;
+        proxy_pass http://localhost:3001/health;
+    }
+}
